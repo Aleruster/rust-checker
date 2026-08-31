@@ -439,32 +439,6 @@ def _read_at(f, off, n):
     except OSError:
         return b""
 
-def _has_fake_signature(f):
-    """Проверяет есть ли в файле цифровая подпись.
-    Если подпись есть от Microsoft/Google/Apple — это явно читовский лоадер
-    (обычные Windows программы подписаны корректно, подделка — признак читовского лоадера)."""
-    try:
-        head = _read_at(f, 0, 0x100)
-        if head[:2] != b"MZ" or len(head) < 0x40:
-            return False
-        e = struct.unpack_from("<I", head, 0x3C)[0]
-        if not (0x40 <= e <= len(head) - 24):
-            return False
-        if head[e:e + 4] != b"PE\x00\x00":
-            return False
-        # Проверяем наличие сертификата в PE структуре
-        # Certificate Table RVA находится в Optional Header в смещении 144 (32-bit) или 160 (64-bit)
-        magic = struct.unpack_from("<H", head, e + 24)[0]
-        cert_offset = e + 144 if magic == 0x10b else e + 160
-        if cert_offset + 8 <= len(head):
-            cert_rva, cert_size = struct.unpack_from("<II", head, cert_offset)
-            # Если есть сертификат с ненулевым размером — подозрительно
-            if cert_rva > 0 and cert_size > 0:
-                return True
-    except (struct.error, OSError):
-        pass
-    return False
-
 def pe_header_info(f):
 
     head = _read_at(f, 0, 0x1000)
@@ -569,23 +543,19 @@ def fingerprint_file(path, size):
     try:
         with open(long_path(path), "rb", buffering=0) as f:
             info = pe_header_info(f)
-            # Дополнительно проверяем подделку цифровой подписи (признак лоадера)
-            fake_sig = _has_fake_signature(f)
     except OSError:
         info = None
-        fake_sig = False
     if info is None:
 
         if _name_hit(base.lower()):
             return {"path": path, "size": size, "basename": base,
-                    "sections": [], "export": "", "pdb": "", "fake_sig": fake_sig}
+                    "sections": [], "export": "", "pdb": ""}
         return None
     names, exp, pdb = info
     return {"path": path, "size": size, "basename": base,
             "sections": [n.decode("latin1", "ignore") for n in names],
             "export": exp.decode("latin1", "ignore"),
-            "pdb": pdb.decode("latin1", "ignore"),
-            "fake_sig": fake_sig}
+            "pdb": pdb.decode("latin1", "ignore")}
 
 def _post_json(url, payload, timeout=30):
     import urllib.request
