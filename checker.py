@@ -207,6 +207,74 @@ def _name_hit(low):
         return False
     return any(n in low for n in _HINTS["names"])
 
+_IL2CPP_SIGS = [
+    b"il2cpp_domain_get", b"il2cpp_class_from_name",
+    b"il2cpp_class_get_methods", b"il2cpp_method_get_name",
+    b"il2cpp_field_get_offset", b"il2cpp_string_new",
+    b"il2cpp_object_new", b"il2cpp_assembly_get_image",
+    b"il2cpp_domain_get_assemblies",
+]
+_CHEAT_SIGS = [
+    (b"no_recoil", "no recoil"), (b"no_spread", "no spread"),
+    (b"bullet_tp", "bullet TP"), (b"pSilent", "silent aim"),
+    (b"aim_enable", "aimbot"), (b"PlayerESP", "ESP"),
+    (b"WorldESP", "world ESP"), (b"chams_mat", "chams"),
+    (b"_ZTest", "chams ZTest"), (b"insta_eoka", "instant eoka"),
+    (b"GetModifiedAimConeDirection", "aim cone hook"),
+    (b"AddPunch", "recoil hook"), (b"aimAngles", "aim manipulation"),
+    (b"HitEntity", "hit manipulation"), (b"SendProjectileUpdate", "bullet spoof"),
+    (b"traveledDistance", "bullet distance spoof"),
+    (b"DrawVisuals", "ESP render"), (b"DrawRect", "box ESP"),
+    (b"healthbar", "healthbar ESP"),
+]
+_GAME_SIGS = [
+    b"GameAssembly.dll", b"BasePlayer", b"BaseCombatEntity",
+    b"BaseProjectile", b"PlayerModel", b"LocalPlayer",
+    b"MainMenuSystem", b"RustClient.exe",
+]
+_INJ_SIGS = [
+    (b"FreeLibraryAndExitThread", "self-unload"),
+    (b"CreateRemoteThread", "remote thread"),
+    (b"InjectViaTempFile", "temp file inject"),
+    (b"wevtutil", "event log wipe"),
+    (b"deletejournal", "USN journal wipe"),
+    (b"CleanLoaderTraces", "trace cleanup"),
+]
+
+def _dll_deep_scan(path):
+    try:
+        sz = os.path.getsize(path)
+        if sz < 4096 or sz > 50 * 1024 * 1024:
+            return None
+        with open(path, "rb") as f:
+            raw = f.read()
+        if raw[:2] != b"MZ":
+            return None
+    except OSError:
+        return None
+
+    tags = []
+    il2cpp = sum(1 for s in _IL2CPP_SIGS if s in raw)
+    if il2cpp >= 3:
+        tags.append(f"IL2CPP ({il2cpp} API)")
+    game = sum(1 for s in _GAME_SIGS if s in raw)
+    if game >= 2:
+        tags.append(f"game SDK ({game})")
+    cheats = [(d, s) for s, d in _CHEAT_SIGS if s in raw]
+    if cheats:
+        names = [d for d, _ in cheats[:4]]
+        tags.append(", ".join(names) + (f" +{len(cheats)-4}" if len(cheats) > 4 else ""))
+    inj = [(d, s) for s, d in _INJ_SIGS if s in raw]
+    if inj:
+        tags.append("inject: " + ", ".join(d for d, _ in inj[:3]))
+
+    score = il2cpp * 8 + game * 5 + len(cheats) * 12 + len(inj) * 10
+    if b"DllMain" in raw and b"CreateThread" in raw and (il2cpp > 0 or cheats):
+        score += 20
+
+    return {"path": path, "score": min(score, 100), "tags": tags,
+            "size": sz, "sha256": hashlib.sha256(raw).hexdigest()} if tags else None
+
 _DIR_MAPS = {}
 
 def dir_map(vol):
@@ -518,7 +586,7 @@ _HINTS = {"names": [], "min_size": MIN_SIZE, "max_size": MAX_SIZE}
 _RULES = {"banner": {"tg": HEADER_TG, "ds": HEADER_DS},
           "trace_names": TRACE_NAMES, "injector_words": INJECTOR_WORDS,
           "exloader": EXLOADER}
-SCAN_BATCH = 800
+SCAN_BATCH = 4000
 HASH_WORKERS = 8
 
 def fetch_hints():
@@ -1516,11 +1584,41 @@ def main():
     elif mstat == "error":
         print(f"  {YEL}[*] Память RustClient.exe — ошибка сканирования{R}")
     elif mfind:
-        print(f"  {RED}[*] Подозрительные DLL в памяти — {len(mfind)}{R}")
-        for d in mfind[:30]:
-            print(f"      {d}")
-        if len(mfind) > 30:
-            print(f"      {GRY}... и ещё {len(mfind) - 30}{R}")
+        print(f"  {YEL}[*] Подозрительные DLL в памяти — {len(mfind)}, анализ...{R}")
+        dll_reports = []
+        for d in mfind:
+            p = d.replace("/", os.sep)
+            if os.path.isfile(p):
+                r = _dll_deep_scan(p)
+                if r:
+                    dll_reports.append(r)
+            elif os.path.isfile(d):
+                r = _dll_deep_scan(d)
+                if r:
+                    dll_reports.append(r)
+        dll_reports.sort(key=lambda x: -x["score"])
+        if dll_reports:
+            print(f"  {RED}[*] Опасных DLL: {len(dll_reports)}{R}")
+            print()
+            for r in dll_reports:
+                col = RED if r["score"] >= 50 else YEL
+                print(f"    {col}{r['score']:>3}/100{R}  {os.path.basename(r['path'])}")
+                print(f"           {GRY}{r['path']}{R}")
+                print(f"           {GRY}{r['size']:,} байт  SHA-256: {r['sha256'][:16]}...{R}")
+                for tag in r["tags"]:
+                    print(f"           {col}{tag}{R}")
+                print()
+        safe_only = [d for d in mfind
+                     if not any(r["path"].lower().replace("/", os.sep) in d.lower().replace("/", os.sep)
+                                or d.lower().replace("/", os.sep) in r["path"].lower().replace("/", os.sep)
+                                for r in dll_reports)]
+        if safe_only:
+            print(f"  {GRY}[*] Неопознанные DLL (не системные, без угроз): {len(safe_only)}{R}")
+            for d in safe_only[:10]:
+                print(f"      {GRY}{d}{R}")
+            if len(safe_only) > 10:
+                print(f"      {GRY}... +{len(safe_only) - 10}{R}")
+            print()
     else:
         print(f"  {GRN}[*] Память RustClient.exe — подозрительных DLL нет{R}")
     print(f"  {GRY}{mdt:.1f} c{R}")
